@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  # The Data Service (handles raw bar and trade fetching)
+  data:
+    build:
+      context: .
+      dockerfile: data/Dockerfile
+    # No ports are exposed to the outside world, only to the gateway and other services
+    # The container will run on port 8090 as defined in data/main.py
+    env_file: .env
+    restart: unless-stopped
+
+  # The Analytics Service (handles VWAP, indicators, context)
+  analytics:
+    build:
+      context: .
+      dockerfile: analytics/Dockerfile
+    # No ports exposed to the outside world
+    # The container will run on port 8091 as defined in analytics/main.py
+    env_file: .env
+    environment:
+      # This critical line tells the analytics service how to find the data service
+      - DATA_API_BASE=http://data:8090
+    depends_on:
+      - data
+    restart: unless-stopped
+
+  # The API Gateway (the single public entry point)
+  api_gateway:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      # This is the ONLY port you will use to talk to your app
+      - "8080:8080"
+    volumes:
+      # This mounts your Caddyfile config into the gateway container
+      - ./Caddyfile:/etc/caddy/Caddyfile
