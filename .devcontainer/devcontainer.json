@@ -1,0 +1,22 @@
+{
+  "name": "ticktalk",
+  "build": { "dockerfile": "Dockerfile" },
+  "forwardPorts": [8080, 8090, 8091],
+  "portsAttributes": {
+    "8080": { "label": "Caddy", "onAutoForward": "openBrowser" },
+    "8090": { "label": "DATA" },
+    "8091": { "label": "ANALYTICS" }
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "python -m venv .venv && . .venv/bin/activate && pip install -U pip && pip install -r requirements.txt && sudo bash -lc 'apt-get update && apt-get install -y caddy'",
+  "customizations": {
+    "vscode": {
+      "settings": { "terminal.integrated.defaultProfile.linux": "bash" },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "esbenp.prettier-vscode"
+      ]
+    }
+  }
+}
