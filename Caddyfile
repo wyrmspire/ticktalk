@@ -1,26 +1,35 @@
-# Caddyfile
 :8080 {
-    # Requests for raw data go to the data
-    handle_path /api/bars* {
-        reverse_proxy http://data:8090
-    }
-    handle_path /api/trades* {
-        reverse_proxy http://data:8090
-    }
-    
-    # Requests for analysis go to the analytics
-    handle_path /api/vwap* {
-        reverse_proxy http://analytics:8091
-    }
-    handle_path /api/indicators* {
-        reverse_proxy http://analytics:8091
-    }
-    handle_path /api/context* {
-        reverse_proxy http://analytics:8091
+    # --- Data server (preserve full path) ---
+    @bars path /api/bars*
+    handle @bars {
+        reverse_proxy http://127.0.0.1:8090
     }
 
-    # Health checks can go anywhere
-    handle_path /health* {
-        reverse_proxy http://data:8090
+    @trades path /api/trades*
+    handle @trades {
+        reverse_proxy http://127.0.0.1:8090
+    }
+
+    # --- Analytics server (preserve full path) ---
+    @vwap path /api/vwap*
+    handle @vwap {
+        reverse_proxy http://127.0.0.1:8091
+    }
+
+    @indicators path /api/indicators*
+    handle @indicators {
+        reverse_proxy http://127.0.0.1:8091
+    }
+
+    @context path /api/context*
+    handle @context {
+        reverse_proxy http://127.0.0.1:8091
+    }
+
+    # --- Local health endpoint served by Caddy ---
+    @health path /health*
+    handle @health {
+        header Content-Type application/json
+        respond `{"ok":true,"via":"caddy"}` 200
     }
 }
