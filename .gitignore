@@ -1,13 +1,36 @@
-# Environment variables
-.env
-
-# Python cache
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
+*.egg-info/
+.eggs/
+.build/
+dist/
+.pytest_cache/
 
-# Virtual environment
+# Environments
 .venv/
-venv/
+.venv*/
 env/
+venv/
+*.env
+!*.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Node (if/when you add the SignalR JS bridge)
+node_modules/
+npm-debug.log*
+yarn.lock
+pnpm-lock.yaml
+
+# Docker artifacts
+*.pid
