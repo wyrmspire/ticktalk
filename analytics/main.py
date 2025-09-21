@@ -1,3 +1,211 @@
+# ---------- FLASK APP ----------
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+app = Flask(__name__)
+CORS(app)
+# ---------- TIMEZONE (America/Chicago) ----------
+try:
+    from zoneinfo import ZoneInfo
+    CT = ZoneInfo("America/Chicago")
+except Exception:
+    from datetime import timezone as _tz
+    CT = _tz(timedelta(hours=-6))
+
+# ---------- LOGIC: swings, breaches, FVG ----------
+def _iso_z(dt):
+    if isinstance(dt, str):
+        s = dt.strip()
+        return s if s.endswith("Z") or (len(s) >= 6 and s[-6] in "+-") else (s + "Z")
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+def _swing_points(bars, left=2, right=2):
+    swings = []
+    n = len(bars)
+    for i in range(left, n - right):
+        try:
+            hi = all(bars[i]["h"] >= bars[i - k]["h"] for k in range(1, left + 1)) and \
+                 all(bars[i]["h"] >= bars[i + k]["h"] for k in range(1, right + 1))
+            lo = all(bars[i]["l"] <= bars[i - k]["l"] for k in range(1, left + 1)) and \
+                 all(bars[i]["l"] <= bars[i + k]["l"] for k in range(1, right + 1))
+        except Exception:
+            continue
+        if hi:
+            swings.append({"type": "swing_high", "idx": i, "price": bars[i]["h"], "time": bars[i]["t"]})
+        if lo:
+            swings.append({"type": "swing_low", "idx": i, "price": bars[i]["l"], "time": bars[i]["t"]})
+    return swings
+
+def _breached_after(bars, level_price, start_idx, breach_type):
+    for j in range(start_idx + 1, len(bars)):
+        h = bars[j]["h"]; l = bars[j]["l"]
+        if breach_type == "swing_high" and h is not None and h > level_price + 1e-9:
+            return True, bars[j]["t"]
+        if breach_type == "swing_low" and l is not None and l < level_price - 1e-9:
+            return True, bars[j]["t"]
+    return False, None
+
+def _find_fvgs_15m(bars15):
+    gaps = []
+    for i in range(2, len(bars15)):
+        a = bars15[i-2]; c = bars15[i]
+        ah = a.get("h"); al = a.get("l")
+        ch = c.get("h"); cl = c.get("l")
+        if ah is None or al is None or ch is None or cl is None:
+            continue
+        if cl > ah:
+            gaps.append({
+                "type": "bullish",
+                "bar_index": i,
+                "start": ah,
+                "end": cl,
+                "formed_at": c.get("t"),
+                "filled": False,
+                "filled_at": None
+            })
+        if ch < al:
+            gaps.append({
+                "type": "bearish",
+                "bar_index": i,
+                "start": ch,
+                "end": al,
+                "formed_at": c.get("t"),
+                "filled": False,
+                "filled_at": None
+            })
+    return gaps
+
+def _mark_fvg_fills(gaps, subsequent_bars):
+    for g in gaps:
+        for b in subsequent_bars:
+            h = b.get("h"); l = b.get("l")
+            if h is None or l is None:
+                continue
+            if l <= g["end"] and h >= g["start"]:
+                g["filled"] = True
+                g["filled_at"] = b.get("t")
+                break
+    return gaps
+
+# ---------- CONTEXT LEVELS ROUTE ----------
+@app.get("/api/context/levels")
+def levels():
+    """
+    Query params:
+      - symbol or contract (one required)
+      - asOf: ISO8601 UTC (default now)
+      - live: true/false (optional; affects contract search & bars)
+    Returns JSON with:
+      - h4_untaken_levels (last 5 days of 4h bars)
+      - m15_sessions (Asian & London highs/lows for the asOf CT day)
+      - m15_prevclose_swings (15m swings since previous 3:00pm CT)
+      - m15_open_fvgs (unfilled 15m fair value gaps)
+    """
+    sym = request.args.get("symbol")
+    con = request.args.get("contract")
+    live_flag = str(request.args.get("live", "false")).lower() in ("1", "true", "yes", "y")
+    as_of = request.args.get("asOf")
+
+    if not sym and not con:
+        return jsonify({"error": "Provide ?symbol= or ?contract="}), 400
+
+    if not con:
+        con = resolve_contract(symbol=sym, live=live_flag)
+        if not con:
+            return jsonify({"error": f"No contract found for symbol '{sym}'"}), 404
+
+    now_utc = datetime.now(timezone.utc)
+    if as_of:
+        try:
+            asof = datetime.fromisoformat(as_of.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            return jsonify({"error": "Bad asOf format; use ISO8601 like 2025-09-19T15:00:00Z"}), 400
+    else:
+        asof = now_utc
+
+    # --- 4h bars (Hour x 4), last 5 days window ---
+    start_h4_utc = asof - timedelta(days=5, hours=1)
+    bars_h4 = retrieve_bars(con, _iso_z(start_h4_utc), _iso_z(asof), 3, 4, live=live_flag)
+    swings = _swing_points(bars_h4, left=2, right=2)
+    h4_levels = []
+    for s in swings:
+        taken, taken_at = _breached_after(bars_h4, s["price"], s["idx"], s["type"])
+        if not taken:
+            h4_levels.append({
+                "type": s["type"],
+                "price": s["price"],
+                "formed_at": s["time"],
+                "untaken": True
+            })
+
+    # --- 15m bars for sessions + prev close ---
+    asof_ct = asof.astimezone(CT)
+    day_ct = asof_ct.date()
+
+    asian_start = datetime(day_ct.year, day_ct.month, day_ct.day, 18, 0, tzinfo=CT) - timedelta(days=1)
+    asian_end   = datetime(day_ct.year, day_ct.month, day_ct.day, 2, 0, tzinfo=CT)
+    london_start = datetime(day_ct.year, day_ct.month, day_ct.day, 2, 0, tzinfo=CT)
+    london_end   = datetime(day_ct.year, day_ct.month, day_ct.day, 7, 30, tzinfo=CT)
+    prev_close_ct = datetime(day_ct.year, day_ct.month, day_ct.day, 15, 0, tzinfo=CT) - timedelta(days=1)
+
+    m15_fetch_start = asian_start - timedelta(hours=2)
+    bars_15 = retrieve_bars(con, _iso_z(m15_fetch_start), _iso_z(asof), 2, 15, live=live_flag)
+
+    def _slice(bars, start_ct, end_ct):
+        out = []
+        su = start_ct.astimezone(timezone.utc)
+        eu = end_ct.astimezone(timezone.utc)
+        for b in bars:
+            try:
+                t = datetime.fromisoformat(str(b["t"]).replace("Z", "+00:00")).astimezone(timezone.utc)
+            except Exception:
+                continue
+            if su <= t <= eu:
+                out.append(b)
+        return out
+
+    def _hl(bars):
+        if not bars:
+            return None
+        highs = [b["h"] for b in bars if b["h"] is not None]
+        lows  = [b["l"] for b in bars if b["l"] is not None]
+        if not highs or not lows:
+            return None
+        hi = max(highs); lo = min(lows)
+        when_hi = next((b["t"] for b in bars if b["h"] == hi), None)
+        when_lo = next((b["t"] for b in bars if b["l"] == lo), None)
+        return {"high": hi, "high_at": when_hi, "low": lo, "low_at": when_lo, "count": len(bars)}
+
+    asian_15  = _slice(bars_15, asian_start, asian_end)
+    london_15 = _slice(bars_15, london_start, london_end)
+    asian_hl  = _hl(asian_15)
+    london_hl = _hl(london_15)
+
+    since_prev_close = _slice(bars_15, prev_close_ct, asof_ct)
+    m15_swings = _swing_points(since_prev_close, left=2, right=2)
+    m15_since_prevclose_levels = [{"type": s["type"], "price": s["price"], "formed_at": s["time"]} for s in m15_swings]
+
+    fvgs_all = _find_fvgs_15m(bars_15)
+    for g in fvgs_all:
+        tail = bars_15[g["bar_index"] + 1:] if g["bar_index"] + 1 < len(bars_15) else []
+        _mark_fvg_fills([g], tail)
+    open_fvgs = [g for g in fvgs_all if not g["filled"]]
+
+    return jsonify({
+        "asOf": _iso_z(asof),
+        "contractId": con,
+        "h4_untaken_levels": h4_levels,
+        "m15_sessions": {
+            "asian": asian_hl,
+            "london": london_hl,
+            "asian_window_ct": {"start": asian_start.isoformat(), "end": asian_end.isoformat()},
+            "london_window_ct": {"start": london_start.isoformat(), "end": london_end.isoformat()},
+        },
+        "m15_prevclose_swings": {
+            "since_prev_close_ct": {"start": prev_close_ct.isoformat(), "end": asof_ct.isoformat()},
+            "levels": m15_since_prevclose_levels
+        },
+        "m15_open_fvgs": open_fvgs
+    })
 #!/usr/bin/env python3
 """
 ANALYTICS SERVER
