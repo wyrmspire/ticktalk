@@ -344,26 +344,42 @@ def api_trades():
         trades = trades or []
 
         def _norm_trade(t: Dict[str, Any]) -> Dict[str, Any]:
+            # side (your logic is fine)
             side = t.get("side") or t.get("action") or t.get("type")
             if isinstance(side, str):
                 s = side.upper()
                 side = "BUY" if s in ("B", "BUY", "LONG", "0") else ("SELL" if s in ("S", "SELL", "SHORT", "1") else None)
             elif isinstance(side, (int, float, bool)):
                 side = "BUY" if int(side) == 0 else "SELL"
-            ts = t.get("createdAt") or t.get("timestamp") or t.get("time")
+
+            # timestamp: include creationTimestamp + normalize ISO strings
+            ts = (t.get("createdAt") or
+                  t.get("creationTimestamp") or
+                  t.get("timestamp") or
+                  t.get("time"))
             if isinstance(ts, (int, float)):
                 epoch = float(ts)
-                if epoch > 1000000000000: epoch /= 1000.0
+                if epoch > 1000000000000:  # ms -> s
+                    epoch /= 1000.0
                 ts = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            elif isinstance(ts, str):
+                ts = _norm_iso_z(ts)
+
             return {
                 "id": t.get("id") or t.get("tradeId") or t.get("fillId") or t.get("orderId"),
                 "accountId": t.get("accountId"),
                 "symbolId": t.get("symbolId") or t.get("contractId") or t.get("contract"),
                 "side": side,
-                "qty": t.get("quantity") or t.get("qty") or t.get("q"),
+                # qty: include size as first-choice (per docs), then fallbacks
+                "qty": (t.get("size") or t.get("quantity") or t.get("qty") or t.get("q")),
                 "price": t.get("price") or t.get("avgPrice") or t.get("fillPrice") or t.get("p"),
-                "time": ts,
+                "time": ts,  # keep your field name
+                # optional extras you might want:
+                # "pnl": t.get("profitAndLoss"),
+                # "fees": t.get("fees"),
+                # "orderId": t.get("orderId"),
             }
+
 
         out = [_norm_trade(t) for t in trades]
         return jsonify({"accountId": account_id, "count": len(out), "trades": out})
