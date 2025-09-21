@@ -46,6 +46,7 @@ Notes
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -87,25 +88,49 @@ except Exception:
     from datetime import timezone as _tz
     CT = _tz(timedelta(hours=-6))
 
-# ---------- UTIL ----------
-def parse_iso_z(s: str) -> datetime:
-    s = (s or "").strip()
+# ---------- TIME UTIL (robust ISO parsing & UTC Z normalization) ----------
+def parse_any_iso_to_utc(dt_str: str) -> datetime:
+    """
+    Accepts ISO strings with:
+      - 'Z' suffix (UTC)
+      - explicit numeric offset (e.g., -05:00 / +01:30)
+      - naive (no offset) -> treated as UTC
+    Returns timezone-aware datetime in UTC.
+    """
+    s = (dt_str or "").strip()
     if not s:
         raise ValueError("empty time")
+    # Normalize 'Z' to '+00:00' so fromisoformat accepts it
     if s.endswith("Z"):
-        s = s[:-1]
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
-    raise ValueError("Invalid ISO Z time")
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        # Fallback: try common second/microsecond formats without offset then treat as UTC
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+        raise ValueError("Invalid ISO time")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
+def parse_iso_z(s: str) -> datetime:
+    # Backward-friendly wrapper keeping original name
+    return parse_any_iso_to_utc(s)
 
 def fmt_iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
+def norm_to_utc_z(dt_like: Any) -> str:
+    """Accepts ISO string or datetime and returns UTC '...Z' string."""
+    if isinstance(dt_like, datetime):
+        return fmt_iso_z(dt_like)
+    return fmt_iso_z(parse_any_iso_to_utc(str(dt_like)))
 
+# ---------- CME WEEKEND ----------
 def cme_weekend_status(dt_utc: datetime) -> Dict[str, Any]:
     """Fri 20:00Z close → Sun 22:00Z open; boundaries are OPEN."""
     weekday = dt_utc.weekday()  # Mon=0..Sun=6
@@ -120,11 +145,9 @@ def cme_weekend_status(dt_utc: datetime) -> Dict[str, Any]:
     closed = (dt_utc > fri_close) and (dt_utc < sun_open)
     return {"closed": closed, "fridayClose": fri_close, "sundayOpen": sun_open}
 
-
 # ---------- HTTP/AUTH ----------
 _session_token: Optional[str] = None
 _token_expiry_epoch: float = 0.0
-
 
 def _http_post(url: str, headers: Dict[str, str], json_body: Dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS) -> requests.Response:
     last_exc: Optional[Exception] = None
@@ -144,7 +167,6 @@ def _http_post(url: str, headers: Dict[str, str], json_body: Dict[str, Any], tim
             if attempt < RETRY_MAX:
                 time.sleep(RETRY_BACKOFF * attempt)
     raise last_exc or RuntimeError("HTTP POST failed with no details")
-
 
 def _auth_token() -> str:
     global _session_token, _token_expiry_epoch
@@ -166,14 +188,12 @@ def _auth_token() -> str:
     log("Authenticated (token cached)")
     return _session_token
 
-
 def _auth_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {_auth_token()}",
         "Content-Type": "application/json",
         "accept": "text/plain",
     }
-
 
 # ---------- Contracts / History ----------
 INTERVAL_MAP: Dict[str, Tuple[int, int]] = {
@@ -188,10 +208,8 @@ INTERVAL_MAP: Dict[str, Tuple[int, int]] = {
     "1d": (4, 1),
 }
 
-
 def _interval_to_unit(interval: str) -> Tuple[int, int]:
     return INTERVAL_MAP.get((interval or DEFAULT_INTERVAL or "1m").lower(), (2, 1))
-
 
 def _search_contracts(search_text: str, live: bool, limit: int = 50) -> List[Dict[str, Any]]:
     url = f"{API_BASE}/api/Contract/search"
@@ -205,7 +223,6 @@ def _search_contracts(search_text: str, live: bool, limit: int = 50) -> List[Dic
         return js
     return []
 
-
 def _search_contract_by_id(contract_code: str) -> Optional[Dict[str, Any]]:
     url = f"{API_BASE}/api/Contract/searchById"
     body = {"contractId": contract_code}
@@ -213,7 +230,6 @@ def _search_contract_by_id(contract_code: str) -> Optional[Dict[str, Any]]:
     js = r.json() or {}
     c = js.get("contract")
     return c if isinstance(c, dict) else None
-
 
 def _pick_front(contracts: List[Dict[str, Any]]) -> Optional[str]:
     if not contracts:
@@ -223,7 +239,7 @@ def _pick_front(contracts: List[Dict[str, Any]]) -> Optional[str]:
         return fronts[0].get("id") or fronts[0].get("code")
     return contracts[0].get("id") or contracts[0].get("code")
 
-
+@lru_cache(maxsize=512)
 def resolve_contract(symbol: Optional[str] = None, contract: Optional[str] = None, live: bool = False) -> Optional[str]:
     if contract and contract.upper().startswith("CON."):
         c = _search_contract_by_id(contract)
@@ -245,7 +261,6 @@ def resolve_contract(symbol: Optional[str] = None, contract: Optional[str] = Non
                 return cid
     return None
 
-
 def retrieve_bars(
     contract_id: str,
     start_iso: str,
@@ -260,8 +275,8 @@ def retrieve_bars(
     body = {
         "contractId": contract_id,
         "live": bool(live),
-        "startTime": start_iso,
-        "endTime": end_iso,
+        "startTime": norm_to_utc_z(start_iso),
+        "endTime": norm_to_utc_z(end_iso),
         "unit": int(unit),
         "unitNumber": int(unit_number),
         "limit": int(limit),
@@ -275,10 +290,8 @@ def retrieve_bars(
         return js
     return []
 
-
 def _gx(b: Dict[str, Any], short_key: str, long_key: str):
     return b.get(short_key) if b.get(short_key) is not None else b.get(long_key)
-
 
 def _f(x: Any) -> float:
     try:
@@ -286,12 +299,9 @@ def _f(x: Any) -> float:
     except Exception:
         return 0.0
 
-
 # ---------- Indicators ----------
-
 def series_close(bars: List[Dict[str, Any]]) -> List[float]:
     return [_f(_gx(b, "c", "close")) for b in bars]
-
 
 def sma(values: List[float], length: int) -> List[Optional[float]]:
     out: List[Optional[float]] = []
@@ -302,7 +312,6 @@ def sma(values: List[float], length: int) -> List[Optional[float]]:
             s -= values[i - length]
         out.append(s / length if i >= length - 1 else None)
     return out
-
 
 def ema(values: List[float], length: int) -> List[Optional[float]]:
     out: List[Optional[float]] = []
@@ -320,7 +329,6 @@ def ema(values: List[float], length: int) -> List[Optional[float]]:
         e = (v - e) * k + e
         out.append(e)
     return out
-
 
 def rsi(values: List[float], length: int) -> List[Optional[float]]:
     out: List[Optional[float]] = []
@@ -351,7 +359,6 @@ def rsi(values: List[float], length: int) -> List[Optional[float]]:
             out.append(100.0 - (100.0 / (1.0 + rs)))
     return out
 
-
 def compute_vwap(bars: List[Dict[str, Any]]) -> Dict[str, Any]:
     cum_pv = 0.0
     cum_v = 0.0
@@ -368,16 +375,7 @@ def compute_vwap(bars: List[Dict[str, Any]]) -> Dict[str, Any]:
         series.append({"time": _gx(b, "t", "time"), "typicalPrice": tp, "vwap": vwap_val, "close": c, "volume": v})
     return {"final": series[-1]["vwap"] if series else 0.0, "series": series, "count": len(series)}
 
-
-# ---------- Simple TA for context ----------
-
-def _iso_z_any(x: Any) -> str:
-    if isinstance(x, str):
-        s = x.strip()
-        return s if s.endswith("Z") or (len(s) >= 6 and s[-6] in "+-") else (s + "Z")
-    return fmt_iso_z(x if isinstance(x, datetime) else datetime.now(timezone.utc))
-
-
+# ---------- Context helpers ----------
 def _swing_points(bars: List[Dict[str, Any]], left: int = 2, right: int = 2) -> List[Dict[str, Any]]:
     swings: List[Dict[str, Any]] = []
     n = len(bars)
@@ -397,7 +395,6 @@ def _swing_points(bars: List[Dict[str, Any]], left: int = 2, right: int = 2) -> 
             swings.append({"type": "swing_low", "idx": i, "price": _gx(bars[i], "l", "low"), "time": _gx(bars[i], "t", "time")})
     return swings
 
-
 def _breached_after(bars: List[Dict[str, Any]], level_price: float, start_idx: int, breach_type: str) -> Tuple[bool, Optional[str]]:
     for j in range(start_idx + 1, len(bars)):
         h = _gx(bars[j], "h", "high")
@@ -407,7 +404,6 @@ def _breached_after(bars: List[Dict[str, Any]], level_price: float, start_idx: i
         if breach_type == "swing_low" and l is not None and l < level_price - 1e-9:
             return True, _gx(bars[j], "t", "time")
     return False, None
-
 
 def _find_fvgs_15m(bars15: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     gaps: List[Dict[str, Any]] = []
@@ -420,8 +416,7 @@ def _find_fvgs_15m(bars15: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         cl = _gx(c, "l", "low")
         if None in (ah, al, ch, cl):
             continue
-        # Bullish FVG if c.low > a.high
-        if cl > ah:
+        if cl > ah:  # Bullish FVG
             gaps.append({
                 "type": "bullish",
                 "bar_index": i,
@@ -431,8 +426,7 @@ def _find_fvgs_15m(bars15: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "filled": False,
                 "filled_at": None,
             })
-        # Bearish FVG if c.high < a.low
-        if ch < al:
+        if ch < al:  # Bearish FVG
             gaps.append({
                 "type": "bearish",
                 "bar_index": i,
@@ -444,7 +438,6 @@ def _find_fvgs_15m(bars15: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             })
     return gaps
 
-
 def _mark_fvg_fills(gaps: List[Dict[str, Any]], subsequent_bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for g in gaps:
         for b in subsequent_bars:
@@ -452,20 +445,16 @@ def _mark_fvg_fills(gaps: List[Dict[str, Any]], subsequent_bars: List[Dict[str, 
             l = _gx(b, "l", "low")
             if h is None or l is None:
                 continue
-            # Any overlap fills the gap
             if l <= g["end"] and h >= g["start"]:
                 g["filled"] = True
                 g["filled_at"] = _gx(b, "t", "time")
                 break
     return gaps
 
-
 # ---------- Routes ----------
-
 @app.get("/health")
 def health():
     return {"ok": True, "service": "analytics_server"}
-
 
 @app.get("/hours")
 def hours():
@@ -478,10 +467,9 @@ def hours():
         "sundayOpen": fmt_iso_z(st["sundayOpen"]),
     }
 
-
 @app.get("/api/bars")
 def api_bars():
-    """Lightweight wrapper for retrieve_bars
+    """Wrapper for retrieve_bars
        Query: symbol or contract (one required), tf (alias of interval), start, end, include_partial, live
        Example tf: 1m, 5m, 15m, 1h, 4h
     """
@@ -497,11 +485,21 @@ def api_bars():
             return jsonify({"error": "Provide start and end ISO8601 times"}), 400
         if not symbol and not contract:
             return jsonify({"error": "Provide ?symbol= or ?contract="}), 400
+
         cid = resolve_contract(symbol=symbol, contract=contract, live=live)
         if not cid:
             return jsonify({"error": "Could not resolve contract"}), 400
+
         unit, num = _interval_to_unit(tf)
-        bars = retrieve_bars(cid, _iso_z_any(start), _iso_z_any(end), unit, num, include_partial=include_partial, live=live)
+        bars = retrieve_bars(
+            cid,
+            norm_to_utc_z(start),
+            norm_to_utc_z(end),
+            unit,
+            num,
+            include_partial=include_partial,
+            live=live,
+        )
         series = [
             {
                 "time": _gx(b, "t", "time"),
@@ -521,12 +519,10 @@ def api_bars():
         log(f"/api/bars unhandled: {e}", "ERROR")
         return jsonify({"error": str(e)}), 500
 
-
 def _decide_route(end_dt: datetime) -> bool:
     """auto route: if end within AUTO_LIVE_FRESH_MINUTES, use live else nonlive."""
     recent_cut = datetime.now(timezone.utc) - timedelta(minutes=AUTO_LIVE_FRESH_MINUTES)
     return end_dt >= recent_cut
-
 
 def _clip_for_weekend(req_start_dt: datetime, req_end_dt: datetime, status: Dict[str, Any]) -> Tuple[datetime, datetime, bool]:
     """Return (effective_start, effective_end, clipped?) — clips only if inside the gap."""
@@ -536,13 +532,12 @@ def _clip_for_weekend(req_start_dt: datetime, req_end_dt: datetime, status: Dict
         return new_start, new_end, True
     return req_start_dt, req_end_dt, False
 
-
 @app.get("/api/vwap")
 def api_vwap():
     try:
         symbol = request.args.get("symbol")
         contract = request.args.get("contract")
-        interval = request.args.get("interval", DEFAULT_INTERVAL)
+        interval = request.args.get("tf", request.args.get("interval", DEFAULT_INTERVAL))
         include_partial = request.args.get("include_partial", "false").lower() == "true"
 
         route = (request.args.get("route", "auto") or "auto").lower()  # auto|live|nonlive
@@ -653,13 +648,12 @@ def api_vwap():
         log(f"/api/vwap unhandled: {e}", "ERROR")
         return jsonify({"error": str(e)}), 500
 
-
 @app.get("/api/indicators")
 def api_indicators():
     try:
         symbol = request.args.get("symbol")
         contract = request.args.get("contract")
-        interval = request.args.get("interval", DEFAULT_INTERVAL)
+        interval = request.args.get("tf", request.args.get("interval", DEFAULT_INTERVAL))
         include_partial = request.args.get("include_partial", "false").lower() == "true"
 
         # indicators requested
@@ -762,7 +756,6 @@ def api_indicators():
     except Exception as e:
         log(f"/api/indicators unhandled: {e}", "ERROR")
         return jsonify({"error": str(e)}), 500
-
 
 # --- Context levels (robust variant) ---
 @app.get("/api/context/levels")
@@ -874,7 +867,6 @@ def context_levels():
     except Exception as e:
         log(f"/api/context/levels unhandled: {e}", "ERROR")
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == "__main__":
     log(f"Starting ANALYTICS server on http://{HOST}:{PORT}")

@@ -106,6 +106,31 @@ def _auth_headers() -> Dict[str, str]:
             "Content-Type": "application/json",
             "accept": "text/plain"}
 
+# ---------- TIME UTIL (normalize to UTC 'Z') ----------
+def _parse_any_iso_to_utc(dt_str: str) -> datetime:
+    s = (dt_str or "").strip()
+    if not s:
+        raise ValueError("empty time")
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+        raise ValueError("Invalid ISO time")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _norm_iso_z(x: str) -> str:
+    """Accepts '...Z' or '...±HH:MM' or naive; returns UTC ISO with 'Z'."""
+    dt = _parse_any_iso_to_utc(x)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
 # ---------- Contract resolution ----------
 def _search_contracts(search_text: str, live: bool) -> List[Dict[str, Any]]:
     url = f"{API_BASE}/api/Contract/search"
@@ -182,8 +207,8 @@ def _retrieve_bars(contract_id: str, start_iso: str, end_iso: str, interval: str
     body = {
         "contractId": contract_id,
         "live": bool(live),
-        "startTime": start_iso,
-        "endTime": end_iso,
+        "startTime": _norm_iso_z(start_iso),
+        "endTime": _norm_iso_z(end_iso),
         "unit": unit,
         "unitNumber": unit_number,
         "limit": int(limit),
@@ -194,11 +219,6 @@ def _retrieve_bars(contract_id: str, start_iso: str, end_iso: str, interval: str
     return js.get("bars") or (js if isinstance(js, list) else [])
 
 # ---------- Utils ----------
-def _norm_iso_z(s: str) -> str:
-    s = (s or "").strip()
-    if not s: return s
-    return s if s.endswith("Z") or (len(s) >= 6 and s[-6] in "+-") else (s + "Z")
-
 def _bars_to_series(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for b in bars or []:
@@ -289,7 +309,6 @@ def api_trades():
         if not start or not end:
             return jsonify({"error": "Provide both ?start= and ?end= (ISO8601)"}), 400
 
-        # Accounts fetch & default
         @lru_cache(maxsize=1)
         def _cached_accounts():
             url = f"{API_BASE}/api/Account/search"
@@ -344,7 +363,6 @@ def api_trades():
         trades = trades or []
 
         def _norm_trade(t: Dict[str, Any]) -> Dict[str, Any]:
-            # side (your logic is fine)
             side = t.get("side") or t.get("action") or t.get("type")
             if isinstance(side, str):
                 s = side.upper()
@@ -352,34 +370,30 @@ def api_trades():
             elif isinstance(side, (int, float, bool)):
                 side = "BUY" if int(side) == 0 else "SELL"
 
-            # timestamp: include creationTimestamp + normalize ISO strings
             ts = (t.get("createdAt") or
                   t.get("creationTimestamp") or
                   t.get("timestamp") or
                   t.get("time"))
             if isinstance(ts, (int, float)):
                 epoch = float(ts)
-                if epoch > 1000000000000:  # ms -> s
+                if epoch > 1000000000000:
                     epoch /= 1000.0
                 ts = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
             elif isinstance(ts, str):
-                ts = _norm_iso_z(ts)
+                try:
+                    ts = _norm_iso_z(ts)
+                except Exception:
+                    ts = None
 
             return {
                 "id": t.get("id") or t.get("tradeId") or t.get("fillId") or t.get("orderId"),
                 "accountId": t.get("accountId"),
                 "symbolId": t.get("symbolId") or t.get("contractId") or t.get("contract"),
                 "side": side,
-                # qty: include size as first-choice (per docs), then fallbacks
                 "qty": (t.get("size") or t.get("quantity") or t.get("qty") or t.get("q")),
                 "price": t.get("price") or t.get("avgPrice") or t.get("fillPrice") or t.get("p"),
-                "time": ts,  # keep your field name
-                # optional extras you might want:
-                # "pnl": t.get("profitAndLoss"),
-                # "fees": t.get("fees"),
-                # "orderId": t.get("orderId"),
+                "time": ts,
             }
-
 
         out = [_norm_trade(t) for t in trades]
         return jsonify({"accountId": account_id, "count": len(out), "trades": out})
